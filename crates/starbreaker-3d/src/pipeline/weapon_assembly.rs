@@ -443,13 +443,20 @@ fn collect_cdf_weapon_parts(
         .parts
         .iter()
         .map(|part| {
+            let (role, source, transform_source) = if part.is_cdf_model {
+                ("base_model", "cdf_model", "model_root")
+            } else if part.bone_name.is_some() {
+                ("rigid_attachment", "cdf_attachment", "cdf_bonename")
+            } else {
+                ("skin", "cdf_attachment", "shared_skeleton")
+            };
             serde_json::json!({
-                "role": if part.bone_name.is_some() { "rigid_attachment" } else { "skin" },
+                "role": role,
                 "geometry_path": part.path,
                 "material_path": part.material_override,
-                "source": "cdf_attachment",
+                "source": source,
                 "attach_bone": part.bone_name,
-                "transform_source": if part.bone_name.is_some() { "cdf_bonename" } else { "shared_skeleton" },
+                "transform_source": transform_source,
             })
         })
         .collect()

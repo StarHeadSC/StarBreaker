@@ -294,6 +294,11 @@ fn load_geometry_parts(
                         .find(|b| b.name.eq_ignore_ascii_case(bone_name))
                     {
                         transform_mesh_by_bone(&mut extra_mesh, bone);
+                    } else {
+                        log::warn!(
+                            "  CDF part '{}' names bone '{bone_name}', which the skeleton does not have",
+                            part.path
+                        );
                     }
                 }
                 mesh.merge_from(extra_mesh);
@@ -529,19 +534,24 @@ pub(crate) struct GeometryPart {
     pub(crate) bone_name: Option<String>,
     /// Material override from CDF attachment. Takes priority over the DataCore material.
     pub(crate) material_override: Option<String>,
+    /// The CDF's own `Model` geometry rather than one of its attachments.
+    pub(crate) is_cdf_model: bool,
 }
 
 /// Result of resolving a geometry path — all mesh parts plus optional skeleton.
 pub(crate) struct ResolvedGeometry {
     pub(crate) parts: Vec<GeometryPart>,
-    /// Path to .chr skeleton (from CDF Model element). None for direct .skin/.cgf.
+    /// Path to .chr skeleton (from CDF Model element). None for direct .skin/.cgf
+    /// and for a CDF whose Model is geometry (a `.cga`), which is then `parts[0]`.
     pub(crate) skeleton_path: Option<String>,
 }
 
 /// Resolve a geometry path into the list of actual mesh files to load.
 ///
 /// - `.skin`/`.cgf` etc -> single part
-/// - `.cdf` -> parse CharacterDefinition, return all Attachment bindings
+/// - `.cdf` -> parse CharacterDefinition, return all Attachment bindings; a
+///   Model that is geometry rather than a `.chr` skeleton comes first, e.g.
+///   `<Model File="weapon.cga" />` with an empty or bullet-only AttachmentList
 pub(crate) fn resolve_geometry_files(
     p4k: &MappedP4k,
     geometry_path: &str,
@@ -552,6 +562,7 @@ pub(crate) fn resolve_geometry_files(
                 path: geometry_path.to_string(),
                 bone_name: None,
                 material_override: None,
+                is_cdf_model: false,
             }],
             skeleton_path: None,
         });
@@ -570,14 +581,14 @@ pub(crate) fn resolve_geometry_files(
 
     let root = xml.root();
     let mut parts = Vec::new();
-    let mut skeleton_path = None;
+    let mut model_path = None;
 
     for child in xml.node_children(root) {
         if xml.node_tag(child) == "Model" {
             let attrs: std::collections::HashMap<&str, &str> = xml.node_attributes(child).collect();
             if let Some(&file) = attrs.get("File") {
                 if !file.is_empty() {
-                    skeleton_path = Some(file.to_string());
+                    model_path = Some(file.to_string());
                 }
             }
         }
@@ -600,6 +611,7 @@ pub(crate) fn resolve_geometry_files(
                                 .get("Material")
                                 .filter(|s| !s.is_empty())
                                 .map(|s| s.to_string()),
+                            is_cdf_model: false,
                         });
                     }
                 }
@@ -607,16 +619,49 @@ pub(crate) fn resolve_geometry_files(
         }
     }
 
-    if parts.is_empty() {
+    let resolved = assemble_cdf_parts(model_path, parts);
+    if resolved.parts.is_empty() {
         return Err(Error::Other(format!(
-            "CDF {geometry_path} has no attachments"
+            "CDF {geometry_path} has neither model geometry nor attachments"
         )));
     }
+    Ok(resolved)
+}
 
-    Ok(ResolvedGeometry {
+/// Combine a CDF's `Model` with its bound attachments.
+///
+/// The `Model` is the character's base. A `.chr` is a bare skeleton: the
+/// visible geometry comes from the attachments. Any other geometry (a `.cga`)
+/// is the base mesh itself, so it leads the parts. Such a `.cga` carries its
+/// own CompiledBones, which `load_skeleton` reads from `parts[0]` and which
+/// `CA_BONE` attachments name in `BoneName`.
+fn assemble_cdf_parts(model_path: Option<String>, mut parts: Vec<GeometryPart>) -> ResolvedGeometry {
+    let skeleton_path = match model_path {
+        Some(path) if is_skeleton_path(&path) => Some(path),
+        Some(path) => {
+            parts.insert(
+                0,
+                GeometryPart {
+                    path,
+                    bone_name: None,
+                    material_override: None,
+                    is_cdf_model: true,
+                },
+            );
+            None
+        }
+        None => None,
+    };
+    ResolvedGeometry {
         parts,
         skeleton_path,
-    })
+    }
+}
+
+/// A CDF `Model` that only carries a skeleton (`.chr`), as opposed to one that
+/// carries geometry of its own.
+fn is_skeleton_path(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".chr")
 }
 
 /// Load a single mesh file from the P4k, with LOD resolution and material/NMC/texture loading.
@@ -950,4 +995,70 @@ mod tests {
             properties: std::collections::HashMap::new(),
         }
     }
+
+    fn bone_attachment(path: &str, bone: &str) -> GeometryPart {
+        GeometryPart {
+            path: path.to_string(),
+            bone_name: Some(bone.to_string()),
+            material_override: None,
+            is_cdf_model: false,
+        }
+    }
+
+    /// A CDF whose Model is a `.cga` and whose AttachmentList binds nothing
+    /// (the weapons_v7 energy rifles) still has its body: the Model itself.
+    #[test]
+    fn cga_model_without_attachments_is_the_only_part() {
+        let resolved = assemble_cdf_parts(Some("objects/w/rifle_energy_01.cga".to_string()), Vec::new());
+
+        assert_eq!(resolved.parts.len(), 1);
+        assert_eq!(resolved.parts[0].path, "objects/w/rifle_energy_01.cga");
+        assert!(resolved.parts[0].is_cdf_model);
+        assert!(resolved.parts[0].bone_name.is_none());
+        assert!(resolved.skeleton_path.is_none(), "a .cga is geometry, not a skeleton");
+    }
+
+    /// A `.cga` Model with a bullet on a CA_BONE keeps the body as the primary
+    /// part instead of promoting the bullet to it.
+    #[test]
+    fn cga_model_leads_its_bone_attachments() {
+        let resolved = assemble_cdf_parts(
+            Some("objects/w/rifle_ballistic_03.cga".to_string()),
+            vec![bone_attachment("objects/ammo/556mm.cgf", "bullet")],
+        );
+
+        let paths: Vec<&str> = resolved.parts.iter().map(|part| part.path.as_str()).collect();
+        assert_eq!(paths, ["objects/w/rifle_ballistic_03.cga", "objects/ammo/556mm.cgf"]);
+        assert!(resolved.parts[0].is_cdf_model);
+        assert_eq!(resolved.parts[1].bone_name.as_deref(), Some("bullet"));
+    }
+
+    /// A `.chr` Model is only the skeleton; the attachments stay the geometry.
+    #[test]
+    fn chr_model_is_the_skeleton_not_a_part() {
+        let skin = GeometryPart {
+            path: "objects/w/pistol.skin".to_string(),
+            bone_name: None,
+            material_override: None,
+            is_cdf_model: false,
+        };
+        let resolved = assemble_cdf_parts(
+            Some("objects/w/pistol.CHR".to_string()),
+            vec![skin, bone_attachment("objects/ammo/9mm.cgf", "bullet")],
+        );
+
+        assert_eq!(resolved.skeleton_path.as_deref(), Some("objects/w/pistol.CHR"));
+        let paths: Vec<&str> = resolved.parts.iter().map(|part| part.path.as_str()).collect();
+        assert_eq!(paths, ["objects/w/pistol.skin", "objects/ammo/9mm.cgf"]);
+        assert!(resolved.parts.iter().all(|part| !part.is_cdf_model));
+    }
+
+    #[test]
+    fn cdf_without_model_or_bindings_has_no_parts() {
+        let resolved = assemble_cdf_parts(None, Vec::new());
+
+        assert!(resolved.parts.is_empty());
+        assert!(resolved.skeleton_path.is_none());
+    }
+
 }
