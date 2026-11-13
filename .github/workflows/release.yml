@@ -50,9 +50,11 @@ jobs:
           $info | Set-Content stage-addon/BUILD-INFO.txt -Encoding utf8
           Compress-Archive -Path stage-addon/* -DestinationPath "dist/starbreaker-blender-addon-$tag.zip"
 
-          Get-ChildItem dist/*.zip | ForEach-Object {
+          $sums = Get-ChildItem dist/*.zip | ForEach-Object {
             '{0}  {1}' -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), $_.Name
-          } | Set-Content dist/SHA256SUMS.txt -Encoding ascii
+          }
+          # LF line endings, so `sha256sum -c` reads the file on Linux too.
+          [IO.File]::WriteAllText("$PWD/dist/SHA256SUMS.txt", (($sums -join "`n") + "`n"))
           Get-Content dist/SHA256SUMS.txt
 
       - name: Publish release
